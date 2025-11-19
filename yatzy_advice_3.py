@@ -1,5 +1,6 @@
 import pygame, random, sys, requests, textwrap
 from collections import Counter
+import threading
 
 # --- 초기 설정 & 상수 ---
 pygame.init()
@@ -46,17 +47,23 @@ def calc_score(cat, dice):
     if cat == "Full House" and sorted(cnt.values()) == [2,3]: return 25
     if cat == "Small Straight" and any(st.issubset(sset) for st in SMALL_STRAIGHTS): return 30
     if cat == "Large Straight" and sorted(dice) in ([1,2,3,4,5],[2,3,4,5,6]): return 40
+    # Yatzy 카테고리가 아닐 때는 50점 반환하지 않음
     if cat == "Yatzy" and len(cnt)==1 and dice[0]!=0: return 50
     if cat == "Chance": return ssum
     return 0
 
-# --- API ---
-def fetch_advice():
+# --- API (비동기 처리 함수) ---
+def fetch_advice_async(game_instance):
+    game_instance.advice_loading = True
     try:
         r = requests.get("https://api.adviceslip.com/advice", timeout=3)
-        r.raise_for_status(); return r.json()['slip']['advice']
+        r.raise_for_status()
+        result = r.json()['slip']['advice']
     except Exception:
-        return "Time to make a move! (Network or Data Error)"
+        result = "Time to make a move! (Network or Data Error)"
+
+    game_instance.advice_future = result
+    game_instance.advice_loading = False
 
 # --- UI 위젯 ---
 class Button:
@@ -104,6 +111,11 @@ class Game:
         self.turn=0; self.state="NAME_INPUT"; self.active_input=0
         self.yatzy_flash=-1; self.advice=None; self.advice_on=False
         self.turn_t=pygame.time.get_ticks(); self.advice_t=0
+        
+        # 비동기 처리를 위한 변수
+        self.advice_loading = False 
+        self.advice_future = None    
+        
         for p in self.players: p.reset_turn()
 
     # 이벤트
@@ -129,8 +141,8 @@ class Game:
     def ev_playing(self, e):
         cur=self.players[self.turn]
         if self.buttons["roll"].clicked(e) and cur.roll():
-            self.advice_on=True; now=pygame.time.get_ticks()
-            self.turn_t=now; self.advice_t=now-ADVICE_INTERVAL  # 즉시 1회 허용
+            self.advice_on=True; self.advice = None; now=pygame.time.get_ticks()
+            self.turn_t=now; self.advice_t=now-ADVICE_INTERVAL
         elif self.buttons["quit_ingame"].clicked(e): pygame.event.post(pygame.event.Event(pygame.QUIT))
         elif self.buttons["restart"].clicked(e): self.reset()
         elif e.type==pygame.MOUSEBUTTONDOWN and e.button==1:
@@ -144,23 +156,36 @@ class Game:
         if cur.rolls==3: return
         x0=(SCREEN_WIDTH//2)*self.turn
         for i in range(5):
+            # 주사위 클릭 영역을 SCREEN_HEIGHT - 200에 맞춤
             r=pygame.Rect(x0+80+i*100, SCREEN_HEIGHT-200, 80,80)
             if r.collidepoint(self.mouse): cur.held[i]^=True
 
     def click_score(self, cur):
         if cur.rolls==3: return
-        x0=(SCREEN_WIDTH//2)*self.turn; y0, h = 220, 35; y_upper_end = y0+6*h
+        # 점수판 시작 Y를 230으로 설정
+        x0=(SCREEN_WIDTH//2)*self.turn; y0, h = 230, 35; y_upper_end = y0+6*h
         for i,cat in enumerate(SCORE_CATS):
             y = y0+i*h if i<6 else y_upper_end+70+(i-6)*h
             r=pygame.Rect(x0+40, y-10, SCREEN_WIDTH//2-80, h)
             if cur.scores[cat] is None and r.collidepoint(self.mouse):
                 is_yat = len(set(cur.dice))==1 and cur.dice[0]!=0
                 is_bonus = is_yat and cur.yatzy_hits>=1
-                cur.scores[cat] = 50 if is_yat else calc_score(cat, cur.dice)
-                cur.dice=[0]*5
+                
+                # 얏지 카테고리일 때만 50점을 부여하고, 다른 카테고리는 calc_score를 사용합니다.
+                if cat == "Yatzy" and is_yat:
+                    cur.scores[cat] = 50
+                # Yatzy 카테고리 이외에는 calc_score를 사용하여 점수 계산
+                else:
+                    cur.scores[cat] = calc_score(cat, cur.dice)
+                    
+                # Yatzy 보너스 처리 (yatzy_hits 증가)
                 if is_yat:
                     self.yatzy_flash=self.turn
-                    cur.yatzy_hits += 1
+                    if cat != "Yatzy" or cur.scores["Yatzy"] is not None:
+                        cur.yatzy_hits += 1
+                        
+                cur.dice=[0]*5
+                
                 # 턴 변경
                 self.turn^=1; self.players[self.turn].reset_turn(); self.turn_t=pygame.time.get_ticks()
                 self.advice_on=False; self.advice=None; self.yatzy_flash=-1
@@ -172,8 +197,18 @@ class Game:
         self.mouse=pygame.mouse.get_pos()
         for b in self.buttons.values(): b.check(self.mouse)
         now=pygame.time.get_ticks()
-        if self.state=="PLAYING" and self.advice_on and now-self.turn_t>=ADVICE_DELAY and now-self.advice_t>=ADVICE_INTERVAL:
-            self.advice=fetch_advice(); self.advice_t=now
+        
+        # 비동기 API 호출 시작 로직
+        if self.state=="PLAYING" and self.advice_on and not self.advice_loading and \
+           now-self.turn_t>=ADVICE_DELAY and now-self.advice_t>=ADVICE_INTERVAL:
+            
+            threading.Thread(target=fetch_advice_async, args=(self,)).start()
+            self.advice_t=now
+            
+        # 비동기 API 호출 완료 결과 처리
+        if self.advice_future is not None:
+            self.advice = self.advice_future
+            self.advice_future = None
 
     def draw(self):
         getattr(self, f"draw_{self.state.lower()}")(); pygame.display.flip()
@@ -195,7 +230,10 @@ class Game:
         self.draw_player(self.players[1], SCREEN_WIDTH//2)
         cur=self.players[self.turn]
         x=SCREEN_WIDTH//4 + (SCREEN_WIDTH//2)*self.turn
-        draw_text(f"Rolls left: {cur.rolls}", F_SML, BLACK, SCREEN, x, SCREEN_HEIGHT-30, True)
+        
+        # Rolls left 위치 조정
+        draw_text(f"Rolls left: {cur.rolls}", F_SML, BLACK, SCREEN, x, SCREEN_HEIGHT-80, True)
+        
         for k in ("roll","quit_ingame","restart"): self.buttons[k].draw(SCREEN)
         if self.yatzy_flash!=-1: draw_text("YATZY!", F_BIG, GOLD, SCREEN, SCREEN_WIDTH//2, SCREEN_HEIGHT//2, True)
 
@@ -206,13 +244,29 @@ class Game:
             w,h = F_MED.size(p.name)
             pygame.draw.rect(SCREEN, GOLD, (name_x-w//2-10, name_y-h//2-5, w+20, h+10), border_radius=5)
         draw_text(p.name, F_MED, BLACK, SCREEN, name_x, name_y, True)
-        draw_text("Total Score", F_SML, BLACK, SCREEN, name_x, 100, True)
-        draw_text(str(p.total()), F_BIG, BLUE, SCREEN, name_x, 150, True)
-        if is_cur and self.advice and self.advice_on:
-            for i,line in enumerate(textwrap.wrap(self.advice, width=40)):
-                draw_text(line, F_TINY, RED, SCREEN, x0+50, 185 + i*(F_TINY.get_height()+2))
-        # 점수판
-        y0,h = 220,35; y_upper_end=y0+6*h
+        
+        # Total Score 위치 수정: 100 -> 90 (-10 픽셀)
+        draw_text("Total Score", F_SML, BLACK, SCREEN, name_x, 90, True)
+        # 실제 점수 위치 수정: 150 -> 140 (-10 픽셀)
+        draw_text(str(p.total()), F_BIG, BLUE, SCREEN, name_x, 140, True)
+        
+        # 조언 표시: Total Score(140) 아래로 이동하여 155로 조정
+        advice_start_y = 155 
+        if is_cur and self.advice_on:
+            if self.advice_loading:
+                draw_text("Loading advice...", F_TINY, GRAY, SCREEN, x0+50, advice_start_y)
+            elif self.advice:
+                lines = textwrap.wrap(self.advice, width=40)
+                # 최대 7줄까지만 표시
+                for i,line in enumerate(lines):
+                    if i < 7:
+                        draw_text(line, F_TINY, RED, SCREEN, x0+50, advice_start_y + i*(F_TINY.get_height()+2))
+                    else:
+                        break
+                        
+        # 점수판 시작 Y 위치: 230
+        y0,h = 230,35; y_upper_end=y0+6*h
+        
         for i,cat in enumerate(SCORE_CATS):
             y = y0+i*h if i<6 else y_upper_end+70+(i-6)*h
             if i==6: pygame.draw.line(SCREEN, GRAY, (x0+40, y-18), (x0+SCREEN_WIDTH//2-40, y-18), 2)
@@ -225,15 +279,16 @@ class Game:
                 draw_text(str(p.scores[cat]), F_SML, BLACK, SCREEN, x0+450, y)
             elif selectable:
                 is_yat = len(set(p.dice))==1 and p.dice[0]!=0
-                is_bonus = is_yat and p.yatzy_hits>=1
-                pts = 50 if is_yat else calc_score(cat, p.dice)
+                # 얏지 카테고리일 때만 50점 표시, 그 외에는 calc_score 결과
+                pts = 50 if cat == "Yatzy" and is_yat else calc_score(cat, p.dice) 
                 draw_text(str(pts), F_SML, BLUE if hovered else GREEN, SCREEN, x0+450, y)
         draw_text(f"Upper Total: {p.get_upper()} / 63", F_TINY, BLACK, SCREEN, x0+50, y_upper_end+10)
         draw_text(f"Bonus: {p.bonus()}", F_TINY, GOLD if p.bonus()>0 else BLACK, SCREEN, x0+SCREEN_WIDTH//2-120, y_upper_end+35)
-        # 주사위
+        
+        # 주사위 위치: SCREEN_HEIGHT-200 (Y=750)
         if any(d>0 for d in p.dice):
             for i,val in enumerate(p.dice):
-                r=pygame.Rect(x0+80+i*100, SCREEN_HEIGHT-200, 80,80)
+                r=pygame.Rect(x0+80+i*100, SCREEN_HEIGHT-200, 80,80) 
                 pygame.draw.rect(SCREEN, BLACK, r, 2, border_radius=10)
                 draw_dice_face(SCREEN, val, r)
                 if p.held[i]: pygame.draw.rect(SCREEN, RED, r, 4, border_radius=10)
